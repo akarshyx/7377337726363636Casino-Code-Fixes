@@ -1093,6 +1093,15 @@ def nowpayments_callback():
 
     logger.info(f"💰 NOWPayments IPN received: order={order_id}, status={payment_status}, payment_id={payment_id}, ip={request.remote_addr}")
 
+    # NOWPayments is address generation only.  Never let an IPN payload,
+    # signed or otherwise, detect, confirm, or credit a deposit.
+    logger.info(
+        "[IPN] Ignored for settlement; direct blockchain watcher owns "
+        "detection and confirmation payment=%s",
+        payment_id or "missing",
+    )
+    return jsonify({"status": "accepted_for_audit_only"}), 200
+
     # Signature check — verify when IPN_SECRET is configured AND signature is present
     ipn_signature = request.headers.get('x-nowpayments-sig')
     if NOWPAYMENTS_IPN_SECRET and ipn_signature:
