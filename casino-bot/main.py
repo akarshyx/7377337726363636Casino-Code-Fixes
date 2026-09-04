@@ -2069,6 +2069,7 @@ CASINO_UI_ASSETS = {
     "profile": os.path.join(CASINO_ASSET_DIR, "profile_account_banner.jpeg"),
     "crypto_bonus": os.path.join(CASINO_ASSET_DIR, "crypto_bonus_banner.png"),
 }
+casino_asset_file_ids: dict[str, str] = {}
 
 WELCOME_BANNER_PATH = CASINO_UI_ASSETS["menu"]
 DEPOSIT_BANNER_PATH = CASINO_UI_ASSETS["deposit"]
@@ -2142,11 +2143,21 @@ _ensure_permanent_casino_assets()
 
 _CASINO_ASSET_UPLOAD_KEYS = tuple(CASINO_UI_ASSETS.keys())
 
+def _casino_asset_photo_source(asset_key: str):
+    """Return the durable Telegram file_id, falling back to the local asset."""
+    file_id = str(casino_asset_file_ids.get(asset_key) or "").strip()
+    if file_id:
+        return file_id
+    path = CASINO_UI_ASSETS.get(asset_key)
+    return path if path and os.path.isfile(path) and os.path.getsize(path) > 0 else None
+
 def _casino_asset_status_text() -> str:
     lines = ["🖼 <b>Casino UI Images</b>\n"]
     for key in _CASINO_ASSET_UPLOAD_KEYS:
         path = CASINO_UI_ASSETS[key]
-        if os.path.isfile(path) and os.path.getsize(path) > 0:
+        if casino_asset_file_ids.get(key) or (
+            os.path.isfile(path) and os.path.getsize(path) > 0
+        ):
             lines.append(f"✅ <b>{key.replace('_', ' ').title()}</b>")
         else:
             lines.append(f"⚠️ <b>{key.replace('_', ' ').title()}</b> — missing")
@@ -2221,6 +2232,8 @@ async def handle_casino_asset_upload(update: Update, context: ContextTypes.DEFAU
         if os.path.getsize(temp_destination) <= 0:
             raise ValueError("downloaded image is empty")
         os.replace(temp_destination, destination)
+        casino_asset_file_ids[asset_key] = telegram_file_id
+        save_data_critical()
         user_states.pop(f"{owner_id}_casino_asset", None)
         await update.message.reply_text(
             f"✅ <b>{asset_key.replace('_', ' ').title()} image updated.</b>\n"
@@ -5981,6 +5994,7 @@ def load_data():
     global coinflip_stickers, roulette_stickers, rollers_roulette_stickers
     global user_currency_preferences, crypto_house_balances, player_data
     global user_bonus_balances, user_bonus_wager_data, user_pending_bonus_claims, user_crypto_bonus_claims
+    global casino_asset_file_ids
 
     import base64
     data = None
@@ -6256,6 +6270,11 @@ def load_data():
         pending_cctip_requests.update(data.get('pending_cctip_requests', {}))
         disabled_games = set(data.get('disabled_games', []))
         casino_maintenance_mode = bool(data.get('casino_maintenance_mode', False))
+        casino_asset_file_ids = {
+            str(key): str(value)
+            for key, value in (data.get("casino_asset_file_ids", {}) or {}).items()
+            if str(value).strip()
+        }
         profit_tracking = data.get('profit_tracking', {'daily': {}, 'total_deposits': 0, 'total_withdrawals': 0, 'total_house_profit': 0, 'total_games_played': 0})
         vip_users = data.get('vip_users', {})
         user_intel.update(data.get('user_intel', {}))
@@ -6600,6 +6619,7 @@ def _save_data_impl():
          'processed_deposit_txids': list(processed_deposit_txids),
         'crypto_sources': crypto_sources,
         'stuck_deposit_reports': stuck_deposit_reports,
+        'casino_asset_file_ids': casino_asset_file_ids,
         'coinflip_stickers': coinflip_stickers,
         # 'roulette_stickers' intentionally excluded — hardcoded permanently in ROULETTE_STICKER_IDS
         'rollers_roulette_stickers': rollers_roulette_stickers,
