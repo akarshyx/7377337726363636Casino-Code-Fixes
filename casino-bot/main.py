@@ -54,6 +54,7 @@ import uuid
 from io import BytesIO
 import qrcode
 import requests
+from blockchain_deposits import check_address_transactions, fetch_usd_rate
 from flask import Flask, request, jsonify
 from styled_buttons import primary_btn, success_btn, danger_btn, StyledInlineKeyboardButton
 import keno_game
@@ -1268,32 +1269,33 @@ def _format_coin_amount(amt: float, currency: str) -> str:
     return s if s else "0"
 
 def _claim_deposit_processing_notification(payment_id: str) -> bool:
-    """Claim the one-time processing notification for a payment."""
+    """Return whether the processing notification still needs sending.
+
+    The timestamp is written only after Telegram acknowledges the send.  A
+    failed request must remain retryable after a restart or transient outage.
+    """
     if not payment_id:
         return True
     with _processed_payments_lock:
         dep = nowpayments_pending_deposits.get(str(payment_id))
         if not isinstance(dep, dict):
             return True
-        if dep.get("processing_notified_at"):
-            return False
-        dep["processing_notified_at"] = time.time()
-        return True
+        return not bool(dep.get("processing_notified_at"))
 
 def _tg_send_deposit_processing_notification(
     user_id,
     currency,
     coin_amount: float = 0.0,
     usd_amount: float = 0.0,
-) -> None:
+) -> bool:
     """Send the existing transaction-processing notification once."""
     if not user_id:
-        return
+        return False
     try:
         token = os.environ.get("TELEGRAM_BOT_TOKEN", "") or os.environ.get("BOT_TOKEN", "")
         if not token:
             logger.error("BOT_TOKEN not set — cannot send processing notification")
-            return
+            return False
         display_map = {
             "usdttrc20": "USDT", "usdterc20": "USDT", "usdtbsc": "USDT",
             "usdtton": "USDT", "usdtsol": "USDT", "usdtmatic": "USDT",
@@ -1334,10 +1336,13 @@ def _tg_send_deposit_processing_notification(
                 f"[DEPOSIT] Processing message failed for user {user_id}: "
                 f"{response.status_code} {response.text[:200]}"
             )
+            return False
         else:
             logger.info(f"[DEPOSIT] Processing message sent to user {user_id}")
+            return True
     except Exception as err:
         logger.warning(f"[DEPOSIT] Processing message failed (non-fatal): {err}")
+        return False
 
 def _tg_send_deposit_notification(user_id, usd_amount, currency, bonus_msg=None, coin_amount=None, username=None, fee_amount=0.0, txid=None):
     """Send deposit confirmation directly via Telegram Bot API (sync, works from any thread).
@@ -1346,7 +1351,7 @@ def _tg_send_deposit_notification(user_id, usd_amount, currency, bonus_msg=None,
         token = os.environ.get("TELEGRAM_BOT_TOKEN", "") or os.environ.get("BOT_TOKEN", "")
         if not token:
             logger.error("BOT_TOKEN not set — cannot send deposit notification")
-            return
+            return False
 
         cur_up = (currency or "").upper()
         # Normalise NowPayments codes like usdttrc20 → USDT
@@ -1517,8 +1522,10 @@ def _tg_send_deposit_notification(user_id, usd_amount, currency, bonus_msg=None,
         except Exception as grp_err:
             logger.error(f"Deposit group announce exception: {grp_err}")
 
+        return True
     except Exception as e:
         logger.error(f"_tg_send_deposit_notification error: {e}")
+        return False
 
 # Also add a route for /nowpayments/ipn as used in create_nowpayments_payment
 @app.route('/nowpayments/ipn', methods=['POST'])
@@ -4818,10 +4825,18 @@ def _track_nowpayments_pending_deposit(
         ),
         "payment_id": payment_id,
         "pay_address": pay_address,
+        "deposit_address": pay_address,
+        "pay_currency": str(crypto or existing.get("pay_currency") or "").upper(),
         "amount_usd": float(payment_data.get("price_amount") or existing.get("amount_usd") or 0),
         "created_at": float(existing.get("created_at") or created),
         "expires_at": float(existing.get("expires_at") or (created + EXP_SECONDS)),
         "status": existing.get("status", "waiting"),
+        "required_confirmations": int(
+            existing.get("required_confirmations")
+            or os.getenv("DEPOSIT_REQUIRED_CONFIRMATIONS", "2")
+        ),
+        "transactions": existing.get("transactions", {}),
+        "detector_state": existing.get("detector_state", {}),
     }
     save_data()
     logger.info(
@@ -5186,6 +5201,170 @@ async def monitor_active_nowpayments_deposits() -> int:
     if changed:
         save_data()
     return credited_count
+
+
+async def _monitor_direct_blockchain_deposits() -> int:
+    """Monitor saved sessions from their exact address on the source chain.
+
+    This is the only automatic deposit detector.  The older provider-status
+    implementation above is retained as a compatibility reference for old
+    data, but is shadowed by this function before the background loop starts.
+    """
+    now = time.time()
+    credited_count = 0
+    changed = False
+    required = max(1, int(os.getenv("DEPOSIT_REQUIRED_CONFIRMATIONS", "2")))
+
+    # Notification retries are intentionally independent of settlement.  A
+    # Telegram outage must not make a settled transaction eligible for credit
+    # again, and a successful credit must never be repeated just to resend DM.
+    for dep in nowpayments_pending_deposits.values():
+        if not isinstance(dep, dict) or dep.get("status") != "credited":
+            continue
+        if dep.get("confirmation_notified_at"):
+            continue
+        txid = str(dep.get("txid") or "").strip()
+        sent = await asyncio.to_thread(
+            _tg_send_deposit_notification,
+            str(dep.get("user_id") or ""),
+            _safe_float(dep.get("settled_usd_amount")),
+            str(dep.get("pay_currency") or dep.get("crypto") or ""),
+            coin_amount=_safe_float(dep.get("coin_amount")),
+            fee_amount=_safe_float(dep.get("fee_amount")),
+            txid=txid,
+        )
+        if sent:
+            dep["confirmation_notified_at"] = time.time()
+            changed = True
+
+    for payment_id, dep in list(nowpayments_pending_deposits.items()):
+        if not isinstance(dep, dict):
+            continue
+        pid = str(payment_id or dep.get("payment_id") or "").strip()
+        if not pid or dep.get("status") == "credited":
+            continue
+        if pid in processed_payment_ids:
+            dep["status"] = "credited"
+            changed = True
+            continue
+        expires_at = _safe_float(dep.get("expires_at"), 0)
+        if expires_at and now >= expires_at:
+            if dep.get("status") not in {"expired", "credited"}:
+                dep["status"] = "expired"
+                dep["expired_at"] = now
+                changed = True
+            continue
+        address = str(dep.get("pay_address") or dep.get("deposit_address") or "").strip()
+        user_id = str(dep.get("user_id") or "").strip()
+        if not address or not user_id.isdigit():
+            logger.error("[CHAIN] Refusing unbound session payment=%s", pid)
+            continue
+
+        try:
+            observations = await asyncio.to_thread(check_address_transactions, dep)
+        except Exception as exc:
+            logger.warning("[CHAIN] Detector failed payment=%s: %s", pid, exc)
+            continue
+        if not observations:
+            continue
+
+        for observation in observations:
+            txid = str(observation.get("txid") or "").strip()
+            coin_amount = _safe_float(observation.get("coin_amount"))
+            confirmations = int(observation.get("confirmations") or 0)
+            if not txid or coin_amount <= 0:
+                continue
+            txs = dep.setdefault("transactions", {})
+            previous = txs.get(txid, {}) if isinstance(txs, dict) else {}
+            tx_record = {
+                **(previous if isinstance(previous, dict) else {}),
+                "txid": txid,
+                "coin_amount": coin_amount,
+                "confirmations": confirmations,
+                "last_seen_at": now,
+                "source": observation.get("source", "direct_chain"),
+                "status": "confirmed" if confirmations >= required else "confirming",
+            }
+            if not isinstance(txs, dict):
+                dep["transactions"] = txs = {}
+            txs[txid] = tx_record
+            if not dep.get("detected_at"):
+                dep["detected_at"] = now
+                dep["status"] = "confirming"
+                changed = True
+                logger.info(
+                    "[CHAIN] Detected address-bound deposit payment=%s tx=%s "
+                    "confirmations=%s",
+                    pid, txid, confirmations,
+                )
+            if not dep.get("processing_notified_at"):
+                processing_sent = await asyncio.to_thread(
+                    _tg_send_deposit_processing_notification,
+                    user_id,
+                    str(dep.get("crypto") or dep.get("coin") or ""),
+                    coin_amount,
+                    0.0,
+                )
+                if processing_sent:
+                    dep["processing_notified_at"] = time.time()
+                    changed = True
+            if (
+                confirmations < required
+                or tx_record.get("settled_at")
+                or txid in processed_deposit_txids
+            ):
+                if dep.get("status") != "confirming" and confirmations < required:
+                    dep["status"] = "confirming"
+                    changed = True
+                continue
+
+            currency = str(
+                dep.get("crypto") or dep.get("coin") or dep.get("pay_currency") or ""
+            ).upper()
+            rate = await asyncio.to_thread(fetch_usd_rate, currency)
+            usd_amount = round(coin_amount * float(rate or 0), 2)
+            if usd_amount <= 0:
+                logger.warning(
+                    "[CHAIN] No current USD rate for payment=%s currency=%s; "
+                    "settlement deferred", pid, currency,
+                )
+                continue
+            fee = round(usd_amount * DEPOSIT_FEE_RATE, 2)
+            ok = await asyncio.to_thread(
+                _process_confirmed_deposit,
+                user_id=user_id,
+                usd_amount=usd_amount,
+                credited_amount=round(usd_amount - fee, 2),
+                fee_amount=fee,
+                pay_currency=currency,
+                payment_id=pid,
+                source="direct_blockchain",
+                coin_amount=coin_amount,
+                txid=txid,
+            )
+            if ok:
+                tx_record["settled_at"] = time.time()
+                tx_record["status"] = "settled"
+                dep["status"] = "credited"
+                dep["txid"] = txid
+                dep["confirmation_count"] = confirmations
+                dep["settled_at"] = tx_record["settled_at"]
+                credited_count += 1
+                changed = True
+                logger.info(
+                    "[CHAIN] Settled payment=%s user=%s tx=%s gross_usd=%.2f",
+                    pid, user_id, txid, usd_amount,
+                )
+            break
+
+    if changed:
+        save_data()
+    return credited_count
+
+
+# Provider IPN/status APIs are not deposit detectors.  Keep the public
+# function name used by the scheduler, but bind it to the direct-chain path.
+monitor_active_nowpayments_deposits = _monitor_direct_blockchain_deposits
 
 def nowpayments_list_payments(limit: int = 100, status: str = None) -> list:
     """Fetch recent payments from NowPayments API. Returns list of payment dicts."""
@@ -8083,12 +8262,15 @@ def _process_confirmed_deposit(
         # address monitor may already have sent it at the first on-chain
         # detection; IPN/manual recovery paths still send it here.
         if _claim_deposit_processing_notification(payment_id):
-            _tg_send_deposit_processing_notification(
+            processing_sent = _tg_send_deposit_processing_notification(
                 user_id,
                 pay_currency,
                 coin_amount=coin_amount,
                 usd_amount=usd_amount,
             )
+            if processing_sent and payment_id in nowpayments_pending_deposits:
+                nowpayments_pending_deposits[payment_id]["processing_notified_at"] = time.time()
+                save_data()
 
         # 1. Credit balance
         ultra_secure_add_user_balance(user_id, credited_amount, f"deposit_{pay_currency}")
@@ -8174,7 +8356,15 @@ def _process_confirmed_deposit(
         #    at step 1a (immediately after balance credit).  This step only updates
         #    the nowpayments_pending_deposits status flag for tracking purposes.
         if payment_id and payment_id in nowpayments_pending_deposits:
-            nowpayments_pending_deposits[payment_id]['status'] = 'credited'
+            deposit_record = nowpayments_pending_deposits[payment_id]
+            deposit_record['status'] = 'credited'
+            deposit_record['settled_at'] = time.time()
+            deposit_record['settled_usd_amount'] = usd_amount
+            deposit_record['credited_amount'] = credited_amount
+            deposit_record['fee_amount'] = fee_amount
+            deposit_record['coin_amount'] = coin_amount
+            deposit_record['pay_currency'] = pay_currency
+            deposit_record['txid'] = txid
             logger.info(f"[DEPOSIT] Marked nowpayments_pending_deposits[{payment_id}] = credited")
 
         # 9. Activate any pending bonus claim for this user
@@ -8213,14 +8403,17 @@ def _process_confirmed_deposit(
         logger.info(f"[DEPOSIT] save_data_critical() done for user {user_id} payment {payment_id}")
 
         # 12. Send DM + group notification (sync HTTP — works from any thread)
-        _tg_send_deposit_notification(
+        confirmation_sent = _tg_send_deposit_notification(
             user_id, credited_amount, pay_currency,
             bonus_msg=bonus_activation_msg,
             coin_amount=coin_amount,
             fee_amount=fee_amount,
             txid=txid,
         )
-        logger.info(f"[DEPOSIT] Notification sent to user {user_id}")
+        if confirmation_sent and payment_id in nowpayments_pending_deposits:
+            nowpayments_pending_deposits[payment_id]["confirmation_notified_at"] = time.time()
+            save_data()
+        logger.info(f"[DEPOSIT] Notification {'sent' if confirmation_sent else 'queued for retry'} to user {user_id}")
         return True
 
     except Exception as e:
